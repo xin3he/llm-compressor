@@ -16,6 +16,7 @@ from compressed_tensors.utils import (
     align_module_device,
     match_named_modules,
     register_offload_parameter,
+    delete_offload_parameter,
 )
 from loguru import logger
 from pydantic import PrivateAttr
@@ -156,8 +157,6 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
         for _, module in match_named_modules(model, self.targets, self.ignore):
             # Note: No need to register observers for auto-round
             apply_calibration_status(module)
-            # Remove the registered qparams to avoid naming conflicts with AutoRound.
-            QuantizationMetadata.clear_all_qparams(module)
 
         model.apply(enable_quantization)  # quantize at the same time as calibrate
 
@@ -228,23 +227,27 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             wrapped_model.name_or_path, trust_remote_code=True
         )
+
+        # kwargs for AutoRound initialization
+        kwargs = {
+            "iters": self.iters,
+            "enable_torch_compile": self.enable_torch_compile,
+            "batch_size": self.batch_size,
+        }
         if is_mllm_model(wrapped_model):
             processor = AutoProcessor.from_pretrained(
                 wrapped_model.name_or_path, trust_remote_code=True
             )
-        else:
-            processor = None
+            kwargs["processor"] = processor
 
+        llmc_registered_qparams = self._preprocess_qparams(decoding_layer)
         with torch.enable_grad(), align_module_device(decoding_layer):
             ar_quant_scheme = self._mapping_config_to_autoround()
             ar = AutoRound(
                 model=wrapped_model,
                 tokenizer=tokenizer,
-                processor=processor,
                 scheme=ar_quant_scheme,
-                iters=self.iters,
-                enable_torch_compile=self.enable_torch_compile,
-                batch_size=self.batch_size,
+                **kwargs,
             )
             # TODO: configure layer-wise config based on self.resolved_config
             ar.configure_layer_config(enable_gguf_official_mixed=False)
@@ -265,8 +268,9 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             self._q_input = q_input
             # Update offload parameters and remove temporary attributes
             decoding_layer = self._unwrapper_quantized_layer(decoding_layer)
-            self._mapping_qparams(decoding_layer)
+
         decoding_layer.eval()
+        self._postprocess_qparams(decoding_layer, llmc_registered_qparams)
 
     def post_autoround_cleanup(self):
         self._all_module_input.clear()
@@ -326,7 +330,19 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                     setattr(model, name, module.orig_layer)
         return model
 
-    def _mapping_qparams(self, decoding_layer):
+    def _preprocess_qparams(self, model):
+        """Collect all qparams registered by LLMC and remove them to avoid conflicts with AutoRound."""
+        llmc_registered_qparams = {}
+        for name, module in model.named_modules():
+            for key in QuantizationMetadata.all_qparam_names():
+                if hasattr(module, key):
+                    if name not in llmc_registered_qparams:
+                        llmc_registered_qparams[name] = {}
+                    llmc_registered_qparams[name][key] = getattr(module, key).clone()
+                    delete_offload_parameter(module, key)
+        return llmc_registered_qparams
+
+    def _postprocess_qparams(self, model, llmc_registered_qparams):
         """Mapping qparam name from AutoRound to LLMC and register qparams in model."""
         qparams_mapping = {
             # AutoRound parameter name: LLMCompressor parameter name
@@ -337,14 +353,16 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             "act_max": "input_global_scale",
         }
         # Update offload parameters and remove temporary attributes
-        for name, module in decoding_layer.named_modules():
+        for name, module in model.named_modules():
+            # Mapping qparams from AutoRound to LLMC naming
             for ar_param_name, llmc_param_name in qparams_mapping.items():
                 if hasattr(module, ar_param_name):
                     ar_value = getattr(module, ar_param_name)
                     if ar_value is None:
-                        ar_value = torch.empty(1)
+                        continue
                     if not isinstance(ar_value, torch.Tensor):
                         ar_value = torch.tensor(ar_value)
+                    # A special case for NVFP4 act_max to calculate global scale
                     if ar_param_name == "act_max" and self.scheme == "NVFP4":
                         from auto_round.data_type.nvfp import (
                             FLOAT4_E2M1_MAX,
@@ -352,16 +370,20 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
                             get_reciprocal,
                         )
 
-                        param_value = torch.nn.Parameter(
-                            FLOAT8_E4M3_MAX
-                            * FLOAT4_E2M1_MAX
-                            * get_reciprocal(ar_value),
-                            requires_grad=False,
-                        )
-                    else:
-                        param_value = torch.nn.Parameter(ar_value, requires_grad=False)
+                        ar_value = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX * get_reciprocal(ar_value)
+                    # Ensure global scale has shape and its dtype is float32
+                    if "_global_scale" in llmc_param_name:
+                        ar_value = ar_value.float().reshape(1)
+                    param_value = torch.nn.Parameter(ar_value, requires_grad=False)
                     delattr(module, ar_param_name)
                     register_offload_parameter(module, llmc_param_name, param_value)
+
+            # Set place holder for other qparams.
+            if name in llmc_registered_qparams:
+                for qparam_name in llmc_registered_qparams[name]:
+                    if not hasattr(module, qparam_name):
+                        param_value = torch.nn.Parameter(llmc_registered_qparams[name][qparam_name], requires_grad=False)
+                        register_offload_parameter(module, qparam_name, param_value)
 
     def _mapping_config_to_autoround(self):
         if isinstance(self.scheme, str):
