@@ -64,6 +64,8 @@ def suspend_offloading(model: nn.Module):
     """
     offloading_info = dict()
     for name, module in model.named_modules():
+        if not hasattr(module, "weight"):  # skip SiLU or other non-weight layers
+            continue
         offloading_info[name] = (
             get_execution_device(module),
             get_offloaded_device(module),
@@ -73,6 +75,8 @@ def suspend_offloading(model: nn.Module):
     yield
 
     for name, module in model.named_modules():
+        if not hasattr(module, "weight"):  # skip SiLU or other non-weight layers
+            continue
         offload_module(module, *offloading_info[name])
 
 
@@ -144,6 +148,7 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
     enable_torch_compile: bool = True
     batch_size: int = 8
     lr: Optional[float] = None
+    disable_opt_rtn: bool = False
     device_ids: Optional[str] = None
 
     # private variables
@@ -266,6 +271,7 @@ class AutoRoundModifier(Modifier, QuantizationMixin):
             "batch_size": self.batch_size,
             "device_map": self.device_ids,
             "ignore_layers": ",".join(ignore_layers) if ignore_layers else "",
+            "disable_opt_rtn": self.disable_opt_rtn,
         }
 
         llmc_registered_qparams = self._preprocess_qparams(decoding_layer)

@@ -6,7 +6,7 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.autoround import AutoRoundModifier
 
 # Select model and load it.
-MODEL_ID = "/models/Llama-3.1-8B-Instruct"
+MODEL_ID = "mistralai/Ministral-3-8B-Instruct-2512"
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
@@ -25,7 +25,7 @@ ds = get_dataset(
 # Configure the quantization algorithm to run.
 #   * quantize the weights to 4 bit with AutoRound with a group size 128
 recipe = AutoRoundModifier(
-    targets="Linear", scheme="NVFP4", ignore=["lm_head"], iters=1
+    targets="Linear", scheme="NVFP4", ignore=["lm_head"], iters=200
 )
 
 # Apply algorithms.

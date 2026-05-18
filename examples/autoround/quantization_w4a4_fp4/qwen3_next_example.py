@@ -6,7 +6,7 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.autoround import AutoRoundModifier
 
 # Select model and load it.
-MODEL_ID = "/models/Llama-3.1-8B-Instruct"
+MODEL_ID = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
@@ -25,10 +25,22 @@ ds = get_dataset(
 # Configure the quantization algorithm to run.
 #   * quantize the weights to 4 bit with AutoRound with a group size 128
 recipe = AutoRoundModifier(
-    targets="Linear", scheme="NVFP4", ignore=["lm_head"], iters=1
+    targets="Linear",
+    scheme="NVFP4",
+    ignore=[
+        "lm_head",
+        "re:.*mlp.gate$",
+        "re:.*mlp.shared_expert_gate$",
+        "re:.*linear_attn.*",
+    ],
+    iters=0,
+    disable_opt_rtn=True,  # Real RTN without Optimization
 )
 
 # Apply algorithms.
+# MoE calibration is handled automatically by the pipeline.
+# We set `moe_calibrate_all_experts` to True to ensure all experts receive
+# calibration data.
 oneshot(
     model=model,
     dataset=ds,
@@ -37,6 +49,7 @@ oneshot(
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     # disable shuffling to get slightly better mmlu score
     shuffle_calibration_samples=False,
+    moe_calibrate_all_experts=True,
 )
 
 print("\n\n")
